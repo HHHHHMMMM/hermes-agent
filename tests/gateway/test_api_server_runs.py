@@ -4,6 +4,7 @@ Covers:
 - POST /v1/runs — start a run (202)
 - GET /v1/runs/{run_id} — poll run status
 - GET /v1/runs/{run_id}/events — SSE event stream
+- POST /v1/runs/{run_id}/steer — steer a running agent
 - POST /v1/runs/{run_id}/stop — interrupt a running agent
 - Auth, error handling, and cleanup
 """
@@ -49,6 +50,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
+    app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_run_steer)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
 
@@ -189,6 +191,60 @@ class TestStartRun:
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 assert resp.status == 202
+
+    @pytest.mark.asyncio
+    async def test_start_preloads_requested_skill(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_create_agent") as mock_create,
+                patch("agent.skill_commands.resolve_skill_command_key", return_value="/drybulk-lbl"),
+                patch("agent.skill_commands.build_skill_invocation_message", return_value="SKILL BLOCK"),
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "ok"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "skills": ["drybulk-lbl"]},
+                )
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        mock_agent.run_conversation.assert_called_once()
+        assert mock_agent.run_conversation.call_args.kwargs["user_message"] == "SKILL BLOCK\n\nhello"
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_missing_requested_skill(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_create_agent") as mock_create,
+                patch("agent.skill_commands.resolve_skill_command_key", return_value=None),
+            ):
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "skill": "__missing_lbl_skill__"},
+                )
+                payload = await resp.json()
+
+        assert resp.status == 400
+        assert payload["error"]["code"] == "skill_preload_failed"
+        assert "__missing_lbl_skill__" in payload["error"]["message"]
+        mock_create.assert_not_called()
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +496,121 @@ class TestRunEvents:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/v1/runs/run_any/events")
         assert resp.status == 401
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/runs/{run_id}/steer — native run steering
+# ---------------------------------------------------------------------------
+
+
+class TestRunSteer:
+    @pytest.mark.asyncio
+    async def test_steer_active_run_emits_accepted_and_applied(self, adapter):
+        ready = threading.Event()
+        steered = threading.Event()
+
+        class FakeAgent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+
+            def steer(self, text):
+                self.steer_text = text
+                steered.set()
+                return True
+
+            def run_conversation(self, user_message=None, conversation_history=None, task_id=None):
+                ready.set()
+                steered.wait(timeout=3)
+                return {"final_response": "done"}
+
+        fake_agent = FakeAgent()
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=fake_agent):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                data = await resp.json()
+                run_id = data["run_id"]
+                assert ready.wait(timeout=3)
+
+                steer_resp = await cli.post(
+                    f"/v1/runs/{run_id}/steer",
+                    json={"messageId": "msg-1", "message": "revise capacity"},
+                )
+                assert steer_resp.status == 200
+                steer_data = await steer_resp.json()
+                assert steer_data["status"] == "accepted"
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        assert "run.steer.accepted" in body
+        assert "run.steer.applied" in body
+        assert "run.completed" in body
+        assert fake_agent.steer_text == "revise capacity"
+
+    @pytest.mark.asyncio
+    async def test_steer_pending_next_turn_continues_same_run(self, adapter):
+        ready = threading.Event()
+        steered = threading.Event()
+
+        class FakeAgent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+
+            def __init__(self):
+                self.calls = []
+                self.steer_text = ""
+
+            def steer(self, text):
+                self.steer_text = text
+                steered.set()
+                return True
+
+            def run_conversation(self, user_message=None, conversation_history=None, task_id=None):
+                self.calls.append(user_message)
+                if len(self.calls) == 1:
+                    ready.set()
+                    steered.wait(timeout=3)
+                    return {"final_response": "first output", "pending_steer": self.steer_text}
+                return {"final_response": f"second output: {user_message}"}
+
+        fake_agent = FakeAgent()
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=fake_agent):
+                resp = await cli.post("/v1/runs", json={"input": "hello", "session_id": "s1"})
+                data = await resp.json()
+                run_id = data["run_id"]
+                assert ready.wait(timeout=3)
+
+                steer_resp = await cli.post(
+                    f"/v1/runs/{run_id}/steer",
+                    json={"messageId": "msg-2", "message": "late correction"},
+                )
+                assert steer_resp.status == 200
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_resp.json()
+
+        assert fake_agent.calls == ["hello", "late correction"]
+        assert "run.steer.pending_next_turn" in body
+        assert "run.steer.applied" in body
+        assert status["status"] == "completed"
+        assert status["output"] == "second output: late correction"
+
+    @pytest.mark.asyncio
+    async def test_steer_inactive_run_returns_409(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs/run_missing/steer",
+                json={"messageId": "msg-1", "message": "hello"},
+            )
+        assert resp.status == 409
 
 
 # ---------------------------------------------------------------------------

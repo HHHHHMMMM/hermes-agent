@@ -885,10 +885,52 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["run_steer"] is True
+            assert data["features"]["run_skill_preload"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
+            assert "moa" in data
+            assert "presets" in data["moa"]
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
+            assert data["endpoints"]["run_steer"] == {
+                "method": "POST",
+                "path": "/v1/runs/{run_id}/steer",
+            }
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
+
+    @pytest.mark.asyncio
+    async def test_capabilities_advertises_resolved_moa_presets(self, adapter):
+        config = {
+            "moa": {
+                "default_preset": "drybulk-standard-step",
+                "presets": {
+                    "drybulk-standard-step": {
+                        "reference_models": [
+                            {"provider": "openai-codex", "model": "gpt-5.5"},
+                            {"provider": "openai-codex", "model": "gpt-5.5"},
+                            {"provider": "openai-codex", "model": "gpt-5.5"},
+                        ],
+                        "aggregator": {"provider": "openai-codex", "model": "gpt-5.5"},
+                        "max_tokens": 4096,
+                        "fanout": "per_iteration",
+                    },
+                },
+            },
+        }
+        app = _create_app(adapter)
+        with patch("hermes_cli.config.load_config", return_value=config):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/capabilities")
+                assert resp.status == 200
+                data = await resp.json()
+
+        moa = data["moa"]
+        preset = moa["presets"]["drybulk-standard-step"]
+        assert moa["available"] is True
+        assert moa["default_preset"] == "drybulk-standard-step"
+        assert len(preset["reference_models"]) == 3
+        assert preset["aggregator"] == {"provider": "openai-codex", "model": "gpt-5.5"}
+        assert preset["fanout"] == "per_iteration"
 
     @pytest.mark.asyncio
     async def test_capabilities_requires_auth_when_key_configured(self, auth_adapter):

@@ -252,6 +252,95 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
 
 
 @pytest.mark.asyncio
+async def test_session_chat_preloads_requested_bundle_and_skills(auth_adapter, session_db):
+    session_id = session_db.create_session("skill-preload-session", "api_server")
+
+    mock_run = AsyncMock(return_value=({"final_response": "ok", "session_id": session_id}, {"total_tokens": 3}))
+    app = _create_session_app(auth_adapter)
+    with (
+        patch.object(auth_adapter, "_run_agent", mock_run),
+        patch("agent.skill_bundles.resolve_bundle_command_key", return_value="/drybulk-full-modeling"),
+        patch(
+            "agent.skill_bundles.build_bundle_invocation_message",
+            return_value=("BUNDLE BLOCK", ["bundle-skill"], []),
+        ),
+        patch("agent.skill_commands.resolve_skill_command_key", return_value="/drybulk-lbl-assist-modeling"),
+        patch("agent.skill_commands.build_skill_invocation_message", return_value="SKILL BLOCK"),
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={
+                    "message": "next",
+                    "bundle": "drybulk-full-modeling",
+                    "skills": ["drybulk-lbl-assist-modeling"],
+                },
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert resp.status == 200, await resp.text()
+
+    _, kwargs = mock_run.call_args
+    assert kwargs["user_message"] == "BUNDLE BLOCK\n\nSKILL BLOCK\n\nnext"
+
+
+@pytest.mark.asyncio
+async def test_session_chat_deduplicates_skills_already_loaded_by_bundle(auth_adapter, session_db):
+    session_id = session_db.create_session("bundle-dedupe-session", "api_server")
+
+    mock_run = AsyncMock(return_value=({"final_response": "ok", "session_id": session_id}, {"total_tokens": 3}))
+    app = _create_session_app(auth_adapter)
+    with (
+        patch.object(auth_adapter, "_run_agent", mock_run),
+        patch("agent.skill_bundles.resolve_bundle_command_key", return_value="/drybulk-full-modeling"),
+        patch(
+            "agent.skill_bundles.build_bundle_invocation_message",
+            return_value=("BUNDLE BLOCK", ["drybulk-lbl-assist-modeling"], []),
+        ),
+        patch("agent.skill_commands.resolve_skill_command_key", return_value="/drybulk-lbl-assist-modeling"),
+        patch("agent.skill_commands.build_skill_invocation_message", return_value="SKILL BLOCK") as build_skill,
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={
+                    "message": "next",
+                    "bundle": "drybulk-full-modeling",
+                    "skills": ["drybulk-lbl-assist-modeling"],
+                },
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert resp.status == 200, await resp.text()
+
+    _, kwargs = mock_run.call_args
+    assert kwargs["user_message"] == "BUNDLE BLOCK\n\nnext"
+    build_skill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_chat_rejects_when_requested_skills_do_not_load(auth_adapter, session_db):
+    session_id = session_db.create_session("missing-skill-session", "api_server")
+
+    mock_run = AsyncMock()
+    app = _create_session_app(auth_adapter)
+    with (
+        patch.object(auth_adapter, "_run_agent", mock_run),
+        patch("agent.skill_commands.resolve_skill_command_key", return_value=None),
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "next", "skill": "__missing_lbl_skill__"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            assert resp.status == 400
+            payload = await resp.json()
+
+    assert payload["error"]["code"] == "skill_preload_failed"
+    assert "__missing_lbl_skill__" in payload["error"]["message"]
+    mock_run.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db):
     session_id = session_db.create_session("image-session", "api_server")
     image_payload = [
@@ -309,6 +398,34 @@ async def test_session_chat_stream_accepts_multimodal_message(adapter, session_d
 
     assert "event: assistant.completed" in body
     assert captured_kwargs["user_message"] == expected_user_message
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_preloads_requested_skills(adapter, session_db):
+    session_id = session_db.create_session("skill-stream-session", "api_server")
+    captured_kwargs = {}
+
+    async def fake_run(**kwargs):
+        captured_kwargs.update(kwargs)
+        kwargs["stream_delta_callback"]("ok")
+        return {"final_response": "ok", "session_id": session_id}, {"total_tokens": 4}
+
+    app = _create_session_app(adapter)
+    with (
+        patch.object(adapter, "_run_agent", side_effect=fake_run),
+        patch("agent.skill_commands.resolve_skill_command_key", return_value="/direct-skill"),
+        patch("agent.skill_commands.build_skill_invocation_message", return_value="SKILL BLOCK"),
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "stream please", "skill": "direct-skill"},
+            )
+            assert resp.status == 200, await resp.text()
+            body = await resp.text()
+
+    assert "event: assistant.completed" in body
+    assert captured_kwargs["user_message"] == "SKILL BLOCK\n\nstream please"
 
 
 @pytest.mark.asyncio
