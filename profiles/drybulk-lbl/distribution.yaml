@@ -1,0 +1,8 @@
+name: drybulk-lbl
+description: "Drybulk assisted modeling profile for ZBYL lean design simulation"
+hermes_requires: ">=0.18.0"
+author: "ZBYL Project Team"
+license: "MIT"
+distribution_owned:
+  - skills
+  - distribution.yaml

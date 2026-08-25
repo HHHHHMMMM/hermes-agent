@@ -216,6 +216,11 @@ def enforce_turn_budget(
     candidates = []
     total_size = 0
     for i, msg in enumerate(tool_messages):
+        tool_name = msg.get("tool_name") or msg.get("name") or ""
+        if config.resolve_threshold(tool_name) == float("inf"):
+            # Explicitly unbounded tools bypass both the per-result limit and
+            # the aggregate turn limit.
+            continue
         content = msg.get("content", "")
         size = len(content)
         total_size += size

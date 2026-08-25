@@ -528,6 +528,27 @@ class TestEnforceTurnBudget:
         result = enforce_turn_budget([], env=None, config=BudgetConfig(turn_budget=200_000))
         assert result == []
 
+    def test_explicitly_unbounded_tool_bypasses_aggregate_budget(self):
+        content = "x" * 300_000
+        msgs = [{
+            "role": "tool",
+            "name": "unbounded_contract_reader",
+            "tool_name": "unbounded_contract_reader",
+            "tool_call_id": "t-unbounded",
+            "content": content,
+        }]
+
+        result = enforce_turn_budget(
+            msgs,
+            env=None,
+            config=BudgetConfig(
+                turn_budget=200_000,
+                tool_overrides={"unbounded_contract_reader": float("inf")},
+            ),
+        )
+
+        assert result[0]["content"] == content
+
 
 # ── Per-tool threshold integration ────────────────────────────────────
 

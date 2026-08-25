@@ -1034,6 +1034,7 @@ class TestPluginContext:
             '        toolset="plugin_tool_plugin",\n'
             '        schema={"name": "plugin_echo", "description": "Echo", "parameters": {"type": "object", "properties": {}}},\n'
             '        handler=lambda args, **kw: "echo",\n'
+            '        max_result_size_chars=float("inf"),\n'
             '    )\n'
         )
         hermes_home = tmp_path / "hermes_test"
@@ -1049,6 +1050,7 @@ class TestPluginContext:
 
         from tools.registry import registry
         assert "plugin_echo" in registry._tools
+        assert registry.get_max_result_size("plugin_echo") == float("inf")
 
     def test_register_tool_rejects_shadow_without_override(self, tmp_path, monkeypatch, caplog):
         """Without override=True, registering a tool name claimed by a different toolset is rejected."""

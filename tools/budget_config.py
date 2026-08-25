@@ -32,7 +32,7 @@ class BudgetConfig:
     default_result_size: int = DEFAULT_RESULT_SIZE_CHARS
     turn_budget: int = DEFAULT_TURN_BUDGET_CHARS
     preview_size: int = DEFAULT_PREVIEW_SIZE_CHARS
-    tool_overrides: Dict[str, int] = field(default_factory=dict)
+    tool_overrides: Dict[str, int | float] = field(default_factory=dict)
 
     def resolve_threshold(self, tool_name: str) -> int | float:
         """Resolve the persistence threshold for a tool.
